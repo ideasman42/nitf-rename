@@ -1,0 +1,498 @@
+#!/usr/bin/python3
+# GPL License, Version 3.0 or later
+
+'''
+NITF - Nifty Indispensable Text File Rename.
+'''
+
+__all__ = (
+    'rename_paths',
+)
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+import typing
+
+# Support 'dict(...)'
+VCS_PATHS = (
+    ('.git', 'git'),
+    ('.hg', 'hg'),
+    ('.svn', 'svn'),
+)
+
+
+def is_dir_empty(path: str) -> bool:
+    return next(os.scandir(path), None) is None
+
+
+def pretty_quote(text: str) -> str:
+    '''
+    Only use for error messages to give clear output,
+    ``shlex.quote`` that ensures we get quotations.
+    '''
+    text = shlex.quote(text)
+    if text[0] in '\'"':
+        return text
+    else:
+        return '\'{}\''.format(text)
+
+
+def filepath_resolve_vcs_root(
+        path: str,
+        search: typing.Iterator[str],
+) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+    while True:
+        for d in search:
+            if os.path.exists(os.path.join(path, d)):
+                return path, d
+        path_next = os.path.normpath(os.path.join(path, ".."))
+        if path == path_next:
+            break
+        path = path_next
+    return None, None
+
+
+def iter_paths(
+        path: str,
+        filename_check: typing.Callable[[str], bool]=None,
+        recursive: bool=False,
+) -> typing.Iterator[str]:
+    for dirpath, dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            if filename_check is None or filename_check(filename):
+                yield os.path.join(dirpath, filename)
+
+        if not recursive:
+            break
+
+        # skip '.git'
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+
+
+def argparse_create():
+    import argparse
+
+    epilog = (
+        '''\
+Typically this should be executed by a wrapper or shell alias.
+''')
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=epilog,
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    class EditorAction(argparse.Action):
+        def __call__(self, parser, namespace, value, option_string=None):
+            if '{file}' not in value:
+                parser.error('Identifier "{file}" not found in "--editor" argument')
+            setattr(namespace, self.dest, value)
+
+    parser.add_argument(
+        '--editor', dest='editor',
+        metavar='EDITOR_COMMAND', required=True,
+        action=EditorAction,
+        help=(
+            'Command used to edit file and arguments\n'
+            'which will be passed to the editor:\n'
+            '``{file}`` will be replaced\n'
+            'with the file-name.\n'
+            'eg: ``--editor="gvim {file} --nofork"``\n'
+            '\n'
+            'Take care to run the editor in a foreground process to block until the process exits.\n'
+        ),
+    )
+
+    # ----------------
+    # Modified Display
+
+    parser_group = parser.add_argument_group(
+        title='display arguments',
+        description=(
+            'These options control output.'
+        ),
+    )
+
+    parser_group.add_argument(
+        '--quiet',
+        dest='quiet',
+        default=False,
+        action='store_true',
+        help='Only print errors.',
+        required=False,
+    )
+
+    # -----------------
+    # Modified Behavior
+
+    parser_group = parser.add_argument_group(
+        title='renaming behavior arguments',
+        description=(
+            'These options control how renaming is performed.'
+        ),
+    )
+
+    parser_group.add_argument(
+        '--overwrite',
+        dest='overwrite',
+        default=False,
+        action='store_true',
+        help='Allow files to overwrite when new name already exists.',
+        required=False,
+    )
+
+    parser_group.add_argument(
+        '--recursive',
+        dest='recursive',
+        default=False,
+        action='store_true',
+        help='Include files recursively.',
+        required=False,
+    )
+
+    parser_group.add_argument(
+        '--flatten',
+        dest='flatten',
+        default=False,
+        action='store_true',
+        help=(
+            'Remove path prefix from filenames.\n'
+            'Use with "--recursive" to strip the directories from the files.\n'
+        ),
+        required=False,
+    )
+
+    parser_group.add_argument(
+        '--prune-empty',
+        dest='prune_empty',
+        default=False,
+        action='store_true',
+        help='Remove empty directories.',
+        required=False,
+    )
+
+    parser_group.add_argument(
+        '--vcs',
+        dest='vcs_mode',
+        default='none',
+        help='Move using version control.',
+        required=False,
+        choices=('none', 'auto', *(id for (_, id) in VCS_PATHS)),
+    )
+
+    # -------------
+    # Path Matching
+
+    parser_group = parser.add_argument_group(
+        title='filepath matching arguments',
+        description=(
+            'These options control which files are selected to be renamed.'
+        ),
+    )
+
+    parser_group.add_argument(
+        '--include-files',
+        dest='include_files',
+        metavar='INCLUDE_FILES',
+        required=False,
+        help=(
+            'Case insensitive regular expression matched against each file,\n'
+            'only include files that pass.'
+        ),
+    )
+    parser_group.add_argument(
+        '--exclude-files',
+        dest='exclude_files',
+        metavar='EXCLUDE_FILES',
+        required=False,
+        default='\\.',
+        help=(
+            'Case insensitive regular expression matched against each file,\n'
+            'only search files that fail. '
+            'Defaults to "\\." (skip hidden files).'
+        ),
+    )
+
+    parser.add_argument(
+        'search_paths',
+        help='Paths to scan for files to rename.',
+        nargs='+',
+    )
+
+    return parser
+
+
+def rename_paths(
+        *,
+        search_paths: typing.Sequence[str],
+        include_files: str,
+        exclude_files: str,
+        vcs_mode: str,
+        recursive: bool,
+        flatten: bool,
+        overwrite: bool,
+        prune_empty: bool,
+        editor: str,
+        quiet: bool,
+) -> bool:
+    fs_encoding = sys.getfilesystemencoding()
+
+    def re_compile_or_none(expr: str, arg_id: str, flags: int=0) -> typing.Optional[typing.re.Pattern]:
+        try:
+            return re.compile(expr, flags)
+        except Exception as ex:
+            print('Failed to parse regex {} {}, error {}, abort!'.format(
+                arg_id,
+                pretty_quote(expr),
+                pretty_quote(str(ex)),
+            ))
+            return None
+
+    # We might want to optionally use case sensitive path checks.
+    if include_files:
+        include_files = re_compile_or_none(
+            include_files, '--include-files', re.IGNORECASE,
+        )
+        if include_files is None:
+            return False
+    else:
+        include_files = None
+
+    if exclude_files:
+        exclude_files = re_compile_or_none(
+            exclude_files, '--exclude-files', re.IGNORECASE,
+        )
+        if exclude_files is None:
+            return False
+    else:
+        exclude_files = None
+
+    include_files_match = include_files.match if include_files else None
+    exclude_files_match = exclude_files.match if exclude_files else None
+
+    if include_files_match or exclude_files_match:
+        def filename_check(f):
+            if include_files_match and include_files_match(f) is None:
+                return False
+            if exclude_files_match and exclude_files_match(f) is not None:
+                return False
+            return True
+    else:
+        filename_check = None
+
+    paths = []
+    for directory in search_paths:
+        directory = os.path.abspath(directory)
+        for f in sorted(iter_paths(
+                directory,
+                filename_check=filename_check,
+                recursive=recursive,
+        )):
+            paths.append((directory, f))
+
+    if not paths:
+        print('No files found, no action taken.')
+        return True
+
+    if vcs_mode == 'auto':
+        vcs_mode = dict(
+            VCS_PATHS,
+            none='none',
+        )[filepath_resolve_vcs_root(search_paths[0], (p for (p, _) in VCS_PATHS))[1]]
+        if vcs_mode is not 'none':
+            if not quiet:
+                print(f'detected version control: --vcs={vcs_mode}')
+
+    with tempfile.NamedTemporaryFile(suffix='.txt') as file:
+        filename = file.name
+        for directory, f in paths:
+            if '\n' in f:
+                print(
+                    f'Newline found in filename {f!r}, '
+                    'aborting, no action taken'
+                )
+                return False
+
+        for directory, f in paths:
+            if flatten:
+                file.write(os.path.basename(f).encode(fs_encoding))
+            else:
+                file.write(os.path.relpath(f, directory).encode(fs_encoding))
+            file.write(b'\n')
+
+        is_first = True
+        while True:
+            if not is_first:
+                print('\nEdit the names again to resolve the error, Ctrl-C to cancel!')
+
+            is_first = False
+
+            file.flush()
+
+            try:
+                subprocess.check_call(shlex.split(editor.replace('{file}', shlex.quote(file.name))))
+            except KeyboardInterrupt:
+                print('\nCtrl-C detected, rename canceled!')
+                return True
+
+            file.flush()
+            # wait!
+
+            file.seek(0, os.SEEK_SET)
+
+            paths_edit = [
+                os.path.normpath(f.decode(fs_encoding))
+                for f in file.read().rstrip(b'\n').split(b'\n')
+            ]
+
+            ok = True
+
+            if len(paths_edit) != len(paths):
+                # edit again
+                print(
+                    'Edited rename file has different number of lines: '
+                    f'found {len(paths_edit)}, expected {len(paths)}'
+                )
+                # we can't match up paths, continue!
+                continue
+
+            for i, ((directory, f_src), f_dst) in enumerate(zip(paths, paths_edit)):
+                if flatten:
+                    paths_edit[i] = os.path.join(directory, os.path.dirname(f_src), f_dst)
+                else:
+                    paths_edit[i] = os.path.join(directory, f_dst)
+
+            if len(set(paths_edit)) != len(paths_edit):
+                print('Found duplicate destination paths:')
+                paths_edit_set: set = set()
+                for i, f in enumerate(paths_edit, 1):
+                    if f in paths_edit_set:
+                        print(f'  {f} at line {i}')
+                    paths_edit_set.add(f)
+                del paths_edit_set
+                ok = False
+
+            if not overwrite:
+                ok_overwrite = True
+                for i, ((directory, f_src), f_dst) in enumerate(zip(paths, paths_edit), 1):
+                    if os.path.exists(f_dst):
+                        if not os.path.samefile(f_src, f_dst):
+                            if not ok_overwrite:
+                                ok_overwrite = False
+                                print('Destination path exists:')
+                            print(f'  {f} at line {i}')
+                if not ok_overwrite:
+                    ok = False
+                del ok_overwrite
+
+            if ok:
+                break
+        del is_first
+
+    # temp file is removed.
+
+    count_rename = 0
+    count_nop = 0
+    count_error = 0
+
+    for (directory, f_src), f_dst in zip(paths, paths_edit):
+        f_dst_exists = os.path.exists(f_dst)
+
+        if f_dst_exists and os.path.samefile(f_src, f_dst):
+            if not quiet:
+                print(f'  not renaming {f_src!r}')
+            count_nop += 1
+        elif f_dst_exists and not overwrite:
+            # Detect above, but we can't rule out file creation!
+            print(f'  not renaming {f_src!r}, file exists')
+            count_error += 1
+        else:
+            if not flatten:
+                f_dst_directory = os.path.dirname(f_dst)
+                if not os.path.exists(f_dst_directory):
+                    try:
+                        os.makedirs(f_dst_directory)
+                    except Exception as ex:
+                        count_error += 1
+                        print(f'  error creating {f_dst_directory!r} for {f_dst!r} ({ex!r})')
+                        continue
+            # if it exists and is a file, renaming will error below.
+
+            try:
+                if vcs_mode == 'none':
+                    os.rename(f_src, f_dst)
+                elif vcs_mode == 'svn':
+                    if f_dst_exists and overwrite:
+                        subprocess.check_call(['svn', 'rm', '--force', f_dst])
+                    subprocess.check_call(['svn', 'mv', f_src, f_dst])
+                elif vcs_mode == 'git':
+                    if f_dst_exists and overwrite:
+                        subprocess.check_call(['git', 'rm', '--force', f_dst])
+                    subprocess.check_call(['git', 'mv', f_src, f_dst])
+                elif vcs_mode == 'hg':
+                    if f_dst_exists and overwrite:
+                        subprocess.check_call(['hg', 'rm', '--force', f_dst])
+                    subprocess.check_call(['hg', 'mv', f_src, f_dst])
+                else:
+                    raise Exception(f'invalid vcs_mode: {vcs_mode}')
+
+                count_rename += 1
+                if not quiet:
+                    print(f'  renaming {f_src!r} to {f_dst!r}')
+            except Exception as ex:
+                count_error += 1
+                print(f'  error renaming {f_src!r} to {f_dst!r} ({ex!r})')
+
+    if prune_empty:
+        f_src_directory = f_src_directory_prev = None
+        for directory, f_src in paths:
+            f_src_directory = os.path.dirname(f_src)
+            # avoid common case
+            if f_src_directory != f_src_directory_prev:
+                if is_dir_empty(f_src_directory):
+                    try:
+                        # only removes if empty
+                        if not quiet:
+                            print(f'  pruning empty directory {f_src_directory!r}')
+                        os.rmdir(f_src_directory)
+                    except Exception as ex:
+                        print(f'  error pruning empty directory {f_src_directory!r} ({ex!r})')
+
+            f_src_directory_prev = f_src_directory
+        del f_src_directory, f_src_directory_prev
+
+    if not quiet or count_error:
+        print(
+            'finished: renamed '
+            f'{count_rename} files, '
+            f'{count_nop} untouched, '
+            f'{count_error} errors'
+        )
+    return count_error == 0
+
+
+def main() -> int:
+    args = argparse_create().parse_args()
+    ok = rename_paths(
+        search_paths=args.search_paths,
+        include_files=args.include_files,
+        exclude_files=args.exclude_files,
+        recursive=args.recursive,
+        flatten=args.flatten,
+        overwrite=args.overwrite,
+        prune_empty=args.prune_empty,
+        vcs_mode=args.vcs_mode,
+        editor=args.editor,
+        quiet=args.quiet,
+    )
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
