@@ -64,7 +64,9 @@ Rename all files in the current directory::
 
 Rename all C/C++ source files recursively within a git repository::
 
-   nitf-rename --include-files=".+\.(c|h|hh|cxx|cpp|cc|hxx|hpp)$" --recursive --vcs=git --editor="gvim --nofork {file}" .
+   nitf-rename \
+       --editor="gvim --nofork {file}" \
+       --include-files=".+\.(c|h|hh|cxx|cpp|cc|hxx|hpp)$" --recursive --vcs=git .
 
 Help Text
 =========
