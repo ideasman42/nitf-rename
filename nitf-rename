@@ -305,7 +305,7 @@ def rename_paths(
             VCS_PATHS,
             none='none',
         )[filepath_resolve_vcs_root(search_paths[0], (p for (p, _) in VCS_PATHS))[1]]
-        if vcs_mode is not 'none':
+        if vcs_mode != 'none':
             if not quiet:
                 print(f'detected version control: --vcs={vcs_mode}')
 
